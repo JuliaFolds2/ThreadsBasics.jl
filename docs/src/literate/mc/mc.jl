@@ -79,16 +79,16 @@ using OhMyThreads: StaticScheduler
 
 # ## Manual parallelization
 #
-# First, using the `index_chunks` function, we divide the iteration interval `1:N` into
+# First, using the `chunks` function, we divide the iteration interval `1:N` into
 # `nthreads()` parts. Then, we apply a regular (sequential) `map` to spawn a Julia task
 # per chunk. Each task will locally and independently perform a sequential Monte Carlo
 # simulation. Finally, we fetch the results and compute the average estimate for $\pi$.
 
-using OhMyThreads: @spawn, index_chunks
+using OhMyThreads: @spawn, chunks
 
 function mc_parallel_manual(N; nchunks = nthreads())
-    tasks = map(index_chunks(1:N; n = nchunks)) do idcs
-        @spawn mc(length(idcs))
+    tasks = map(chunks(1:N; n = nchunks)) do chunk
+        @spawn mc(length(chunk))
     end
     pi = sum(fetch, tasks) / nchunks
     return pi
@@ -101,13 +101,13 @@ mc_parallel_manual(N)
 @btime mc_parallel_manual($N) samples=10 evals=3;
 
 # It is faster than `mc_parallel` above because the task-local computation
-# `mc(length(idcs))` is faster than the implicit task-local computation within
+# `mc(length(chunk))` is faster than the implicit task-local computation within
 # `tmapreduce` (which itself is a `mapreduce`).
 
-idcs = first(index_chunks(1:N; n = nthreads()))
+chunk = first(chunks(1:N; n = nthreads()))
 
-@btime mapreduce($+, $idcs) do i
+@btime mapreduce($+, $chunk) do i
     rand()^2 + rand()^2 < 1.0
 end samples=10 evals=3;
 
-@btime mc($(length(idcs))) samples=10 evals=3;
+@btime mc($(length(chunk))) samples=10 evals=3;

@@ -30,14 +30,14 @@ data = rand(1_000_000 * nthreads());
 #
 # A common, manual implementation of this idea might look like this:
 
-using OhMyThreads: @spawn, index_chunks
+using OhMyThreads: @spawn, chunks
 
 function parallel_sum_falsesharing(data; nchunks = nthreads())
     psums = zeros(eltype(data), nchunks)
-    @sync for (c, idcs) in enumerate(index_chunks(data; n = nchunks))
+    @sync for (i, chunk) in enumerate(chunks(data; n = nchunks))
         @spawn begin
-            for i in idcs
-                psums[c] += data[i]
+            for x in chunk
+                psums[i] += x
             end
         end
     end
@@ -102,13 +102,13 @@ nthreads()
 
 function parallel_sum_tasklocal(data; nchunks = nthreads())
     psums = zeros(eltype(data), nchunks)
-    @sync for (c, idcs) in enumerate(index_chunks(data; n = nchunks))
+    @sync for (i, chunk) in enumerate(chunks(data; n = nchunks))
         @spawn begin
             local s = zero(eltype(data))
-            for i in idcs
-                s += data[i]
+            for x in chunk
+                s += x
             end
-            psums[c] = s
+            psums[i] = s
         end
     end
     return sum(psums)
@@ -131,8 +131,8 @@ end
 # using `map` and reusing the built-in (sequential) `sum` function on each parallel task:
 
 function parallel_sum_map(data; nchunks = nthreads())
-    ts = map(index_chunks(data, n = nchunks)) do idcs
-        @spawn @views sum(data[idcs])
+    ts = map(chunks(data, n = nchunks)) do chunk
+        @spawn sum(chunk)
     end
     return sum(fetch.(ts))
 end
@@ -141,7 +141,7 @@ end
 @btime parallel_sum_map($data);
 
 # This implementation is conceptually
-# clearer in that there is no explicit modification of shared state, i.e. no `pums[c] = s`,
+# clearer in that there is no explicit modification of shared state, i.e. no `pums[i] = s`,
 # anywhere at all. We can't run into false sharing if we don't modify shared state 😉.
 #
 # Note that since we use the built-in `sum` function, which is highly optimized, we might see
