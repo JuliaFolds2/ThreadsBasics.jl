@@ -191,6 +191,26 @@ end
 # NOTE: once v1.12 releases we should switch this to wait(t; throw=false)
 wait_nothrow(t) = Base._wait(t)
 
+
+"""
+    empty_collection_error(task)
+
+Check if a task failed due to an empty collection error.
+"""
+function empty_collection_error end
+
+@static if VERSION < v"1.11.0-"
+    function empty_collection_error(task)
+        task.result isa MethodError && task.result.f == Base.mapreduce_empty
+    end
+else
+    function empty_collection_error(task)
+        task.result isa ArgumentError &&
+            task.result.msg ==
+            "reducing over an empty collection is not allowed; consider supplying `init` to the reducer"
+    end
+end
+
 # GreedyScheduler w/o chunking
 function _tmapreduce(f,
         op,
@@ -230,7 +250,7 @@ function _tmapreduce(f,
     filtered_tasks = filter(tasks) do stabletask
         task = stabletask.t
         istaskdone(task) || wait_nothrow(task)
-        if task.result isa MethodError && task.result.f == Base.mapreduce_empty
+        if empty_collection_error(task)
             false
         else
             true
@@ -277,7 +297,7 @@ function _tmapreduce(f,
     filtered_tasks = filter(tasks) do stabletask
         task = stabletask.t
         istaskdone(task) || wait_nothrow(task)
-        if task.result isa MethodError && task.result.f == Base.mapreduce_empty
+        if empty_collection_error(task)
             false
         else
             true
