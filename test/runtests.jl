@@ -319,6 +319,8 @@ end;
 end;
 
 @testset "chunking mode + chunksize option" begin
+    @test OhMyThreads.Schedulers.chunking_mode(SerialScheduler()) ==
+          OhMyThreads.Schedulers.NoChunking
     for sched in (DynamicScheduler, StaticScheduler, GreedyScheduler)
         @test sched() isa sched
         @test sched(; chunksize = 2) isa sched
@@ -330,12 +332,12 @@ end;
         @test OhMyThreads.Schedulers.chunking_mode(sched(; chunking = false)) ==
               OhMyThreads.Schedulers.NoChunking
         if sched != GreedyScheduler
-            # For (Dynamic|Static)Scheduler `chunking = false` overrides `nchunks` and
-            # `chunksize`
+            # For (Dynamic|Static)Scheduler `chunking = false` disables all chunking
+            # arguments
             @test OhMyThreads.Schedulers.chunking_mode(sched(;
                 nchunks = 2, chunksize = 4, chunking = false)) ==
                   OhMyThreads.Schedulers.NoChunking
-            @test_throws ErrorException OhMyThreads.Schedulers.chunking_mode(sched(;
+            @test OhMyThreads.Schedulers.chunking_mode(sched(;
                 nchunks = -2, chunksize = -4, split = :whatever, chunking = false)) ==
                   OhMyThreads.Schedulers.NoChunking
             @test OhMyThreads.Schedulers.chunking_enabled(sched(;
@@ -360,6 +362,7 @@ end;
         @test_throws ArgumentError sched(; nchunks = 2, chunksize = 3)
         @test_throws ArgumentError sched(; nchunks = 0, chunksize = 0)
         @test_throws ArgumentError sched(; nchunks = -2, chunksize = -3)
+        @test_throws ArgumentError sched(; nchunks = 2, split = :whatever)
 
         let scheduler = sched(; chunksize = 2, split = :batch)
             @test tmapreduce(sin, +, 1:10; scheduler) ≈ mapreduce(sin, +, 1:10)
@@ -406,6 +409,9 @@ end;
         @test_throws ArgumentError tmapreduce(
             sin, +, 1:10000; ntasks = 3, nchunks = 2, scheduler = s)≈res_tmr
     end
+    @test_throws ArgumentError tmapreduce(sin, +, 1:10000; scheduler = :whatever)
+    @test_throws ArgumentError tmapreduce(
+        sin, +, 1:10000; threadpool = :whatever, chunking = false)
 end;
 
 @testset "empty collections" begin
@@ -708,6 +714,41 @@ end
         return x
     end
     @test test_f() == 10
+end
+
+@testset "show schedulers" begin
+    nt = Threads.nthreads(:default)
+
+    @test repr("text/plain", DynamicScheduler()) ==
+          """
+          DynamicScheduler
+          ├ Chunking: fixed count ($nt), split :consecutive
+          └ Threadpool: default"""
+
+    @test repr(
+        "text/plain", DynamicScheduler(; chunking = false, threadpool = :interactive)) ==
+          """
+          DynamicScheduler
+          ├ Chunking: none
+          └ Threadpool: interactive"""
+
+    @test repr("text/plain", StaticScheduler()) ==
+          """StaticScheduler
+          ├ Chunking: fixed count ($nt), split :consecutive
+          └ Threadpool: default"""
+
+    @test repr("text/plain", StaticScheduler(; chunksize = 2, split = :scatter)) ==
+          """
+          StaticScheduler
+          ├ Chunking: fixed size (2), split :roundrobin
+          └ Threadpool: default"""
+
+    @test repr("text/plain", GreedyScheduler(; chunking = true)) ==
+          """
+         GreedyScheduler
+         ├ Num. tasks: $nt
+         ├ Chunking: fixed count ($(10 * nt)), split :roundrobin
+         └ Threadpool: default"""
 end
 
 # Todo way more testing, and easier tests to deal with

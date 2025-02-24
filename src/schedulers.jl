@@ -11,6 +11,16 @@ isgiven(::T) where {T} = true
 
 const MaybeInteger = Union{Integer, NotGiven}
 
+struct NoSplit <: Split end
+_parse_split(split::Split) = split
+function _parse_split(split::Symbol)
+    split in (:consecutive, :batch) && return Consecutive()
+    split in (:roundrobin, :scatter) && return RoundRobin()
+    throw(ArgumentError("You've provided an unsupported value for `split`"))
+end
+_splitid(x::Type{<:Split}) = nameof(x) |> string |> lowercase |> Symbol
+_splitid(x::Split) = _splitid(typeof(x))
+
 """
 Supertype for all available schedulers:
 
@@ -20,22 +30,135 @@ Supertype for all available schedulers:
 * [`SerialScheduler`](@ref): serial (non-parallel) execution
 """
 abstract type Scheduler end
+#! A subtype of Scheduler (let's call it `S`) **must** implement:
+#   - `from_symbol(::Val{:symbol})` returning exactly `S` for the given symbol.
+#     (e.g. `from_symbol(::Val{:dynamic}) = DynamicScheduler`)
 
+# To enable chunking, S **must** implement:
+#   - `chunking_args(::S)::ChunkingArgs` returning the chunking arguments of the scheduler.
+#     It usually is a field of the scheduler, and use the constructor
+#     `ChunkingArgs` to create it (see below).
+
+# And can optionally implement:
+#   - `default_nchunks(::Type{S})` returning the default number of chunks for the scheduler.
+#     if chunking is enabled. Default is `Threads.nthreads(:default)`.
+
+from_symbol(::Val) = throw(ArgumentError("unkown scheduler symbol"))
+
+scheduler_from_symbol(s::Symbol; kwargs...) = scheduler_from_symbol(Val(s); kwargs...)
+function scheduler_from_symbol(v::Val; kwargs...)
+    sched = from_symbol(v)
+    return sched(; kwargs...)
+end
+
+"""
+    ChunkingMode
+
+A trait type to indicate the chunking mode of a scheduler. The following subtypes are available:
+
+* `NoChunking`: no chunking is used
+* `FixedCount`: the number of chunks is fixed
+* `FixedSize`: the size of each chunk is fixed
+"""
 abstract type ChunkingMode end
 struct NoChunking <: ChunkingMode end
 struct FixedCount <: ChunkingMode end
 struct FixedSize <: ChunkingMode end
 
-function _chunkingstr(s::Scheduler)
-    C = chunking_mode(s)
-    if C == FixedCount
-        cstr = "fixed count ($(s.nchunks)), :$(s.split)"
-    elseif C == FixedSize
-        cstr = "fixed size ($(s.chunksize)), :$(s.split)"
-    elseif C == NoChunking
-        cstr = "none"
-    end
+"""
+    ChunkingArgs{C, S <: Split}(n::Int, size::Int, split::S)
+    ChunkingArgs(Sched::Type{<:Scheduler}, n::MaybeInteger, size::MaybeInteger, split::Union{Symbol, Split}; chunking)
+
+Stores all the information needed for chunking. The type parameter `C` is the chunking mode
+(`NoChunking`, `FixedSize`, or `FixedCount`).
+
+`MaybeInteger` arguments are arguments that can be `NotGiven`. If it is the case, the
+constructor automatically throws errors or gives defaults values while taking into account
+the kind of scheduler (provided by `Sched`, e.g. `DynamicScheduler`). The `chunking` keyword
+argument is a boolean and if true, everything is skipped and `C = NoChunking`.
+
+Once the object is created, use the `has_fieldname(object)` function (e.g. `has_size(object)`)
+to know if the field is effectively used, since it is no longer
+`NotGiven` for type stability.
+"""
+struct ChunkingArgs{C, S <: Split}
+    n::Int
+    size::Int
+    split::S
 end
+ChunkingArgs(::Type{NoChunking}) = ChunkingArgs{NoChunking, NoSplit}(-1, -1, NoSplit())
+function ChunkingArgs(
+        Sched::Type{<:Scheduler},
+        n::MaybeInteger,
+        size::MaybeInteger,
+        split::Union{Symbol, Split};
+        chunking
+)
+    chunking || return ChunkingArgs(NoChunking)
+
+    if !isgiven(n) && !isgiven(size)
+        n = default_nchunks(Sched)
+        size = -1
+    else
+        n = isgiven(n) ? n : -1
+        size = isgiven(size) ? size : -1
+    end
+
+    chunking_mode = size > 0 ? FixedSize : FixedCount
+    split = _parse_split(split)
+    result = ChunkingArgs{chunking_mode, typeof(split)}(n, size, split)
+
+    # argument names in error messages are those of the scheduler constructor instead
+    # of ChunkingArgs because the user should not be aware of the ChunkingArgs type
+    # (e.g. `nchunks` instead of `n`)
+    if !(has_n(result) || has_size(result))
+        throw(ArgumentError("Either `nchunks` or `chunksize` must be a positive integer (or chunking=false)."))
+    end
+    if has_n(result) && has_size(result)
+        throw(ArgumentError("`nchunks` and `chunksize` are mutually exclusive and only one of them may be a positive integer"))
+    end
+    return result
+end
+
+chunking_mode(::ChunkingArgs{C}) where {C} = C
+has_n(ca::ChunkingArgs) = ca.n > 0
+has_size(ca::ChunkingArgs) = ca.size > 0
+has_split(::ChunkingArgs{C, S}) where {C, S} = S !== NoSplit
+chunking_enabled(ca::ChunkingArgs) = chunking_mode(ca) != NoChunking
+
+_chunkingstr(ca::ChunkingArgs{NoChunking}) = "none"
+function _chunkingstr(ca::ChunkingArgs{FixedCount})
+    return "fixed count ($(ca.n)), split :$(_splitid(ca.split))"
+end
+function _chunkingstr(ca::ChunkingArgs{FixedSize})
+    return "fixed size ($(ca.size)), split :$(_splitid(ca.split))"
+end
+
+# Link between a scheduler and its chunking arguments
+# The first and only the first method must be overloaded for each scheduler
+# that supports chunking.
+chunking_args(::Scheduler) = ChunkingArgs(NoChunking)
+
+nchunks(sched::Scheduler) = chunking_args(sched).n
+chunksize(sched::Scheduler) = chunking_args(sched).size
+chunksplit(sched::Scheduler) = chunking_args(sched).split
+
+has_nchunks(sched::Scheduler) = has_n(chunking_args(sched))
+has_chunksize(sched::Scheduler) = has_size(chunking_args(sched))
+has_chunksplit(sched::Scheduler) = has_split(chunking_args(sched))
+
+chunking_mode(sched::Scheduler) = chunking_mode(chunking_args(sched))
+chunking_enabled(sched::Scheduler) = chunking_enabled(chunking_args(sched))
+_chunkingstr(sched::Scheduler) = _chunkingstr(chunking_args(sched))
+
+"""
+    default_nchunks(::Type{<:Scheduler})
+
+Hardcoded default number of chunks, if not provided by the user. Can depend on the
+kind of scheduler.
+"""
+function default_nchunks end
+default_nchunks(::Type{<:Scheduler}) = nthreads(:default)
 
 """
     DynamicScheduler (aka :dynamic)
@@ -70,36 +193,13 @@ with other multithreaded code.
 """
 struct DynamicScheduler{C <: ChunkingMode, S <: Split} <: Scheduler
     threadpool::Symbol
-    nchunks::Int
-    chunksize::Int
-    split::S
+    chunking_args::ChunkingArgs{C, S}
 
-    function DynamicScheduler(threadpool::Symbol, nchunks::Integer, chunksize::Integer,
-            split::Union{Split, Symbol}; chunking::Bool = true)
+    function DynamicScheduler(threadpool::Symbol, ca::ChunkingArgs)
         if !(threadpool in (:default, :interactive))
             throw(ArgumentError("threadpool must be either :default or :interactive"))
         end
-        if !chunking
-            C = NoChunking
-        else
-            if !(nchunks > 0 || chunksize > 0)
-                throw(ArgumentError("Either nchunks/ntasks or chunksize must be a positive integer (or chunking=false)."))
-            end
-            if nchunks > 0 && chunksize > 0
-                throw(ArgumentError("nchunks/ntasks and chunksize are mutually exclusive and only one of them may be a positive integer"))
-            end
-            C = chunksize > 0 ? FixedSize : FixedCount
-        end
-        if split isa Symbol
-            if split in (:consecutive, :batch)
-                split = Consecutive()
-            elseif split in (:roundrobin, :scatter)
-                split = RoundRobin()
-            else
-                error("You've provided an unsupported value for `split`.")
-            end
-        end
-        new{C, typeof(split)}(threadpool, nchunks, chunksize, split)
+        new{chunking_mode(ca), typeof(ca.split)}(threadpool, ca)
     end
 end
 
@@ -110,29 +210,21 @@ function DynamicScheduler(;
         chunksize::MaybeInteger = NotGiven(),
         chunking::Bool = true,
         split::Union{Split, Symbol} = Consecutive())
-    if !chunking
-        nchunks = -1
-        chunksize = -1
-    else
-        # only choose nchunks default if chunksize hasn't been specified
-        if !isgiven(nchunks) && !isgiven(chunksize) && !isgiven(ntasks)
-            nchunks = nthreads(threadpool)
-            chunksize = -1
-        else
-            if isgiven(nchunks) && isgiven(ntasks)
-                throw(ArgumentError("For the dynamic scheduler, nchunks and ntasks are aliases and only one may be provided"))
-            end
-            nchunks = isgiven(nchunks) ? nchunks :
-                      isgiven(ntasks) ? ntasks : -1
-            chunksize = isgiven(chunksize) ? chunksize : -1
+    if isgiven(ntasks)
+        if isgiven(nchunks)
+            throw(ArgumentError("For the dynamic scheduler, nchunks and ntasks are aliases and only one may be provided"))
         end
+        nchunks = ntasks
     end
-    DynamicScheduler(threadpool, nchunks, chunksize, split; chunking)
+    ca = ChunkingArgs(DynamicScheduler, nchunks, chunksize, split; chunking)
+    return DynamicScheduler(threadpool, ca)
 end
+from_symbol(::Val{:dynamic}) = DynamicScheduler
+chunking_args(sched::DynamicScheduler) = sched.chunking_args
 
 function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, s::DynamicScheduler)
     print(io, "DynamicScheduler", "\n")
-    cstr = _chunkingstr(s)
+    cstr = _chunkingstr(s.chunking_args)
     println(io, "├ Chunking: ", cstr)
     print(io, "└ Threadpool: ", s.threadpool)
 end
@@ -167,34 +259,7 @@ Isn't well composable with other multithreaded code though.
     * Beware that for `split=OhMyThreads.RoundRobin()` the order of elements isn't maintained and a reducer function must not only be associative but also **commutative**!
 """
 struct StaticScheduler{C <: ChunkingMode, S <: Split} <: Scheduler
-    nchunks::Int
-    chunksize::Int
-    split::S
-
-    function StaticScheduler(nchunks::Integer, chunksize::Integer, split::Union{Split, Symbol};
-            chunking::Bool = true)
-        if !chunking
-            C = NoChunking
-        else
-            if !(nchunks > 0 || chunksize > 0)
-                throw(ArgumentError("Either nchunks/ntasks or chunksize must be a positive integer (or chunking=false)."))
-            end
-            if nchunks > 0 && chunksize > 0
-                throw(ArgumentError("nchunks/ntasks and chunksize are mutually exclusive and only one of them may be a positive integer"))
-            end
-            C = chunksize > 0 ? FixedSize : FixedCount
-        end
-        if split isa Symbol
-            if split in (:consecutive, :batch)
-                split = Consecutive()
-            elseif split in (:roundrobin, :scatter)
-                split = RoundRobin()
-            else
-                error("You've provided an unsupported value for `split`.")
-            end
-        end
-        new{C, typeof(split)}(nchunks, chunksize, split)
-    end
+    chunking_args::ChunkingArgs{C, S}
 end
 
 function StaticScheduler(;
@@ -203,29 +268,21 @@ function StaticScheduler(;
         chunksize::MaybeInteger = NotGiven(),
         chunking::Bool = true,
         split::Union{Split, Symbol} = Consecutive())
-    if !chunking
-        nchunks = -1
-        chunksize = -1
-    else
-        # only choose nchunks default if chunksize hasn't been specified
-        if !isgiven(nchunks) && !isgiven(chunksize) && !isgiven(ntasks)
-            nchunks = nthreads(:default)
-            chunksize = -1
-        else
-            if isgiven(nchunks) && isgiven(ntasks)
-                throw(ArgumentError("For the static scheduler, nchunks and ntasks are aliases and only one may be provided"))
-            end
-            nchunks = isgiven(nchunks) ? nchunks :
-                      isgiven(ntasks) ? ntasks : -1
-            chunksize = isgiven(chunksize) ? chunksize : -1
+    if isgiven(ntasks)
+        if isgiven(nchunks)
+            throw(ArgumentError("For the static scheduler, nchunks and ntasks are aliases and only one may be provided"))
         end
+        nchunks = ntasks
     end
-    StaticScheduler(nchunks, chunksize, split; chunking)
+    ca = ChunkingArgs(StaticScheduler, nchunks, chunksize, split; chunking)
+    return StaticScheduler(ca)
 end
+from_symbol(::Val{:static}) = StaticScheduler
+chunking_args(sched::StaticScheduler) = sched.chunking_args
 
 function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, s::StaticScheduler)
     print(io, "StaticScheduler", "\n")
-    cstr = _chunkingstr(s)
+    cstr = _chunkingstr(s.chunking_args)
     println(io, "├ Chunking: ", cstr)
     print(io, "└ Threadpool: default")
 end
@@ -264,34 +321,11 @@ some additional overhead.
 """
 struct GreedyScheduler{C <: ChunkingMode, S <: Split} <: Scheduler
     ntasks::Int
-    nchunks::Int
-    chunksize::Int
-    split::S
+    chunking_args::ChunkingArgs{C, S}
 
-    function GreedyScheduler(ntasks::Int, nchunks::Integer, chunksize::Integer,
-            split::Union{Split, Symbol}; chunking::Bool = false)
+    function GreedyScheduler(ntasks::Integer, ca::ChunkingArgs)
         ntasks > 0 || throw(ArgumentError("ntasks must be a positive integer"))
-        if !chunking
-            C = NoChunking
-        else
-            if !(nchunks > 0 || chunksize > 0)
-                throw(ArgumentError("Either nchunks or chunksize must be a positive integer (or chunking=false)."))
-            end
-            if nchunks > 0 && chunksize > 0
-                throw(ArgumentError("nchunks and chunksize are mutually exclusive and only one of them may be a positive integer"))
-            end
-            C = chunksize > 0 ? FixedSize : FixedCount
-        end
-        if split isa Symbol
-            if split in (:consecutive, :batch)
-                split = Consecutive()
-            elseif split in (:roundrobin, :scatter)
-                split = RoundRobin()
-            else
-                error("You've provided an unsupported value for `split`.")
-            end
-        end
-        new{C, typeof(split)}(ntasks, nchunks, chunksize, split)
+        return new{chunking_mode(ca), typeof(ca.split)}(ntasks, ca)
     end
 end
 
@@ -304,23 +338,12 @@ function GreedyScheduler(;
     if isgiven(nchunks) || isgiven(chunksize)
         chunking = true
     end
-    if !chunking
-        nchunks = -1
-        chunksize = -1
-    else
-        # only choose nchunks default if chunksize hasn't been specified
-        if !isgiven(nchunks) && !isgiven(chunksize)
-            # neither nchunks nor chunksize has been specified but chunking = true
-            nchunks = 10 * nthreads(:default)
-            chunksize = -1
-        elseif !isgiven(nchunks)
-            nchunks = -1
-        elseif !isgiven(chunksize)
-            chunksize = -1
-        end
-    end
-    GreedyScheduler(ntasks, nchunks, chunksize, split; chunking)
+    ca = ChunkingArgs(GreedyScheduler, nchunks, chunksize, split; chunking)
+    return GreedyScheduler(ntasks, ca)
 end
+from_symbol(::Val{:greedy}) = GreedyScheduler
+chunking_args(sched::GreedyScheduler) = sched.chunking_args
+default_nchunks(::Type{GreedyScheduler}) = 10 * nthreads(:default)
 
 function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, s::GreedyScheduler)
     print(io, "GreedyScheduler", "\n")
@@ -339,24 +362,6 @@ counterparts, e.g., `mapreduce(sin, +, 1:100)`.
 """
 struct SerialScheduler <: Scheduler
 end
-
-chunking_mode(s::Scheduler) = chunking_mode(typeof(s))
-chunking_mode(::Type{DynamicScheduler{C,S}}) where {C,S} = C
-chunking_mode(::Type{StaticScheduler{C,S}}) where {C,S} = C
-chunking_mode(::Type{GreedyScheduler{C,S}}) where {C,S} = C
-chunking_mode(::Type{SerialScheduler}) = NoChunking
-
-chunking_enabled(s::Scheduler) = chunking_enabled(typeof(s))
-chunking_enabled(::Type{S}) where {S <: Scheduler} = chunking_mode(S) != NoChunking
-
-scheduler_from_symbol(s::Symbol; kwargs...) = scheduler_from_symbol(Val{s}; kwargs...)
-scheduler_from_symbol(::Type{Val{:static}}; kwargs...) = StaticScheduler(; kwargs...)
-scheduler_from_symbol(::Type{Val{:dynamic}}; kwargs...) = DynamicScheduler(; kwargs...)
-scheduler_from_symbol(::Type{Val{:greedy}}; kwargs...) = GreedyScheduler(; kwargs...)
-scheduler_from_symbol(::Type{Val{:serial}}; kwargs...) = SerialScheduler(; kwargs...)
-function scheduler_from_symbol(::Type{Val{T}}; kwargs...) where {T}
-    # fallback
-    throw(ArgumentError("unkown scheduler symbol :$T"))
-end
+from_symbol(::Val{:serial}) = SerialScheduler
 
 end # module

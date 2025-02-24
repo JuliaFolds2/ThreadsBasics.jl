@@ -7,6 +7,7 @@ using OhMyThreads: Scheduler,
                    DynamicScheduler, StaticScheduler, GreedyScheduler,
                    SerialScheduler
 using OhMyThreads.Schedulers: chunking_enabled,
+                              nchunks, chunksize, chunksplit, has_chunksplit,
                               chunking_mode, ChunkingMode, NoChunking,
                               FixedSize, FixedCount, scheduler_from_symbol, NotGiven,
                               isgiven
@@ -25,13 +26,13 @@ function _index_chunks(sched, arg)
     @assert C != NoChunking
     if C == FixedCount
         index_chunks(arg;
-            n = sched.nchunks,
-            split = sched.split)::IndexChunks{
+            n = nchunks(sched),
+            split = chunksplit(sched))::IndexChunks{
             typeof(arg), ChunkSplitters.Internals.FixedCount}
     elseif C == FixedSize
         index_chunks(arg;
-            size = sched.chunksize,
-            split = sched.split)::IndexChunks{
+            size = chunksize(sched),
+            split = chunksplit(sched))::IndexChunks{
             typeof(arg), ChunkSplitters.Internals.FixedSize}
     end
 end
@@ -50,9 +51,9 @@ end
 function _check_chunks_incompatible_kwargs(; kwargs...)
     ks = keys(kwargs)
     if :ntasks in ks || :nchunks in ks || :chunksize in ks || :split in ks
-        error("You've provided `chunks` or `index_chunks` as input and, at the same time, "*
-              "chunking related keyword arguments (e.g. `ntasks`, `chunksize`, or `split`). "*
-              "This isn't supported. "*
+        error("You've provided `chunks` or `index_chunks` as input and, at the same time, " *
+              "chunking related keyword arguments (e.g. `ntasks`, `chunksize`, or `split`). " *
+              "This isn't supported. " *
               "Set the chunking options directly in the `chunks` or `index_chunks` call or drop the latter.")
     end
     if :chunking in ks
@@ -344,8 +345,8 @@ function tmap(f,
     if _scheduler isa GreedyScheduler
         error("Greedy scheduler isn't supported with `tmap` unless you provide an `OutputElementType` argument, since the greedy schedule requires a commutative reducing operator.")
     end
-    if chunking_enabled(_scheduler) && hasfield(typeof(_scheduler), :split) &&
-       _scheduler.split != Consecutive()
+    if chunking_enabled(_scheduler) && has_chunksplit(_scheduler) &&
+       chunksplit(_scheduler) != Consecutive()
         error("Only `split == Consecutive()` is supported because the parallel operation isn't commutative. (Scheduler: $_scheduler)")
     end
     if (A isa AbstractChunks || A isa ChunkSplitters.Internals.Enumerate)
